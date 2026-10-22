@@ -71,6 +71,89 @@ async def rendered_texts(page):
     return items
 
 
+async def scan_and_scroll(page):
+    """Check event text, including ticket items loaded only after scrolling."""
+    latest = []
+
+    async def check():
+        nonlocal latest
+        latest = await rendered_texts(page)
+        return any(TARGET.search(text) for _, _, text in latest)
+
+    for _ in range(3):
+        await page.wait_for_timeout(2200)
+        if await check():
+            return True, latest
+
+    total_steps = 0
+    for frame in list(page.frames):
+        try:
+            count = await frame.evaluate("""() => {
+                const scrollable = [...document.querySelectorAll('body *')].filter(el => {
+                    const box = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return /auto|scroll/.test(style.overflowY)
+                        && el.scrollHeight - el.clientHeight > 120
+                        && box.width >= 230 && box.width <= 850
+                        && box.height >= 170 && box.height <= 1300;
+                });
+                const root = document.scrollingElement;
+                if (root && root.scrollHeight - root.clientHeight > 120 && !scrollable.includes(root)) {
+                    scrollable.push(root);
+                }
+                scrollable.sort((a, b) =>
+                    (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)
+                );
+                window.__nakhwaScrollTargets = scrollable.slice(0, 3);
+                return window.__nakhwaScrollTargets.length;
+            }""")
+        except Exception as exc:
+            print('Scrollable-container inspection error:', type(exc).__name__, flush=True)
+            continue
+
+        print('Scrollable containers in frame:', count, flush=True)
+        for index in range(count):
+            stable_bottom = 0
+            for _ in range(20):
+                try:
+                    info = await frame.evaluate("""idx => {
+                        const el = window.__nakhwaScrollTargets?.[idx];
+                        if (!el || !el.isConnected) return null;
+                        const before = el.scrollTop;
+                        el.scrollTop = Math.min(
+                            before + Math.max(180, el.clientHeight * 0.8),
+                            el.scrollHeight - el.clientHeight
+                        );
+                        return {
+                            before,
+                            after: el.scrollTop,
+                            end: el.scrollHeight - el.clientHeight
+                        };
+                    }""", index)
+                except Exception as exc:
+                    print('Scroll step error:', type(exc).__name__, flush=True)
+                    break
+                if not info:
+                    break
+                total_steps += 1
+                await page.wait_for_timeout(550)
+                if await check():
+                    print('Found event after scrolling; steps:', total_steps, flush=True)
+                    return True, latest
+                # Allow several attempts at bottom for lazy-loaded entries.
+                if info['after'] >= info['end'] - 4:
+                    stable_bottom += 1
+                    if stable_bottom >= 3:
+                        break
+                else:
+                    stable_bottom = 0
+
+    await page.wait_for_timeout(1200)
+    found = await check()
+    print('Finished ticket-list scan; scroll steps:', total_steps, flush=True)
+    return found, latest
+
+
 async def inspect_page():
     Path('debug').mkdir(exist_ok=True)
     async with async_playwright() as p:
@@ -81,13 +164,7 @@ async def inspect_page():
                 await page.goto(TARGET_URL, wait_until='domcontentloaded', timeout=45000)
             except PlaywrightTimeoutError:
                 print('Navigation timed out; inspecting whatever has loaded.', flush=True)
-            latest = []
-            for attempt in range(4):
-                await page.wait_for_timeout(3500)
-                latest = await rendered_texts(page)
-                if any(TARGET.search(text) for _, _, text in latest):
-                    break
-
+            found, latest = await scan_and_scroll(page)
             all_text = '\n'.join(t for _, _, t in latest)
             print('Final browser URL:', page.url, flush=True)
             print('Frames:', len(latest), flush=True)
@@ -96,16 +173,13 @@ async def inspect_page():
                 try:
                     await page.screenshot(path='debug/last_page.png', full_page=False, timeout=15000)
                 except Exception as exc:
-                    print(f'Could not capture screenshot: {type(exc).__name__}', flush=True)
+                    print('Could not capture screenshot:', type(exc).__name__, flush=True)
                 Path('debug/frames.txt').write_text(
                     '\n\n'.join(f'--- frame {idx}: {url} ---\n{text[:2500]}' for idx, url, text in latest),
                     encoding='utf-8',
                 )
-            if any(TARGET.search(t) for _, _, t in latest):
+            if found:
                 return 'found'
-            # Only reset a previously found state if a recognizable booking page loaded.
-            # Loading errors, anti-bot blocks, or unexpected page structures must not
-            # be treated as a genuine disappearance/reappearance.
             valid_booking_ui = (
                 '백제문화단지' in all_text
                 and any(word in all_text for word in ('예매하기', '예약하기', '예매', '예약'))
