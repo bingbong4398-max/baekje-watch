@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Monitor Baekje Cultural Land's Nov. 7 Nakhwa ticket entry and notify Telegram.
 
-This checks whether the exact event ticket product heading is rendered in the
-provided Naver Map ticket pane. It does not confirm inventory or buy tickets.
+Checks (1) reappearance of the exact event entry on Naver Map (once per run), and
+(2) the 2026-11-07 calendar date on the direct Naver booking page (~60s).
+It never logs in, places a reservation, or confirms payment.
 """
 import asyncio
 import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -25,6 +27,7 @@ TARGET_URL = (
     '%26additionalHeight%3D76%26timestamp%3D202610221639'
     '%26locale%3Dko%26svcName%3Dmap_pcv5%26entry%3Dbmp'
 )
+DIRECT_URL = 'https://m.booking.naver.com/booking/5/bizes/557207/items/8117739'
 STATE_FILE = Path('.monitor_state.json')
 TARGET = re.compile(r'2026\s*년\s*백제문화단지\s*낙화놀이\s*[（(]\s*11\s*/\s*7\s*[)）]')
 SEOUL = ZoneInfo('Asia/Seoul')
@@ -49,13 +52,17 @@ def send_telegram(message):
 
 def load_state():
     try:
-        return json.loads(STATE_FILE.read_text('utf-8')).get('visible', False)
-    except (OSError, ValueError):
-        return False
+        state = json.loads(STATE_FILE.read_text('utf-8'))
+        return {
+            'visible': bool(state.get('visible', False)),
+            'calendar': state.get('calendar', 'unknown'),
+        }
+    except (OSError, ValueError, TypeError):
+        return {'visible': False, 'calendar': 'unknown'}
 
 
-def save_state(visible):
-    STATE_FILE.write_text(json.dumps({'visible': visible}, ensure_ascii=False) + '\n', encoding='utf-8')
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False) + '\n', encoding='utf-8')
 
 
 async def rendered_texts(page):
@@ -157,7 +164,7 @@ async def scan_and_scroll(page):
 async def inspect_page():
     Path('debug').mkdir(exist_ok=True)
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+        browser = await p.chromium.launch(channel='chrome', headless=True, args=['--no-sandbox'])
         page = await browser.new_page(locale='ko-KR', timezone_id='Asia/Seoul', viewport={'width': 1400, 'height': 950})
         try:
             try:
@@ -193,36 +200,234 @@ async def inspect_page():
             await browser.close()
 
 
+# Read the exact booking date's rendered calendar cell; do not infer availability
+# merely because the word "매진" is absent elsewhere on the page.
+CALENDAR_JS = r"""() => {
+  const tidy = s => (s || '').replace(/\s+/g, ' ').trim();
+  const visible = el => {
+    if (!el) return false;
+    const css = getComputedStyle(el), b = el.getBoundingClientRect();
+    return css.display !== 'none' && css.visibility !== 'hidden' && b.width > 0 && b.height > 0;
+  };
+  const leaf = el => [...el.children].every(c => !visible(c));
+  const text = el => tidy(el.innerText || el.textContent);
+  const nodes = [...document.querySelectorAll('body *')];
+  // Identify the month heading itself, not '2026.11.07' in an event description.
+  const headings = nodes.filter(el => visible(el) && leaf(el)
+       && /^2026\s*[.\/년-]\s*0?11\s*(월)?\.?$/.test(text(el)));
+  if (!headings.length) return {status:'unknown', reason:'11월 달력 제목 미발견'};
+  for (const h of headings) {
+    const hb = h.getBoundingClientRect();
+    const sevens = nodes.filter(el => visible(el) && leaf(el)
+      && /^0?7\s*(일)?$/.test(text(el)) && (() => {
+        const r=el.getBoundingClientRect();
+        return r.top >= hb.bottom - 8 && r.top <= hb.bottom + 410
+          && Math.abs(r.left - hb.left) < 550;
+      })());
+    for (const seven of sevens) {
+      let tile = seven;
+      let hasSold = false, blocked = false, actionable = false;
+      for (let depth=0; depth < 5 && tile; depth++, tile=tile.parentElement) {
+        const r=tile.getBoundingClientRect(), t=text(tile);
+        // Do not examine entire week, month or the whole page.
+        if (r.width > 180 || r.height > 145 || t.length > 65) break;
+        const meta = [tile.className, tile.getAttribute('aria-label'),
+                      tile.getAttribute('title'), tile.getAttribute('data-state')].join(' ');
+        if (/매진|마감|품절|예약불가|예매불가|sold.?out/i.test(t + ' ' + meta)) hasSold = true;
+        if (tile.matches('[disabled], [aria-disabled="true"], [inert]')
+          || /disabled|inactive|unavailable/i.test(meta)
+          || getComputedStyle(tile).pointerEvents === 'none') blocked = true;
+        if (tile.matches('button,a,[role="button"]') || tile.tabIndex >= 0
+          || getComputedStyle(tile).cursor === 'pointer') actionable = true;
+      }
+      if (hasSold) return {status:'sold_out', reason:'11/7 칸에 매진/마감 확인'};
+      if (actionable && !blocked) return {status:'open', reason:'11/7 매진 없음 + 날짜 선택 가능'};
+    }
+  }
+  return {status:'unknown', reason:'11/7 칸의 선택 가능 상태를 검증하지 못함'};
+}"""
+
+NEXT_MONTH_JS = r"""() => {
+  const norm=s=>(s||'').replace(/\s+/g,' ').trim();
+  const seen=e=>{if(!e)return false;const b=e.getBoundingClientRect(),c=getComputedStyle(e);
+    return b.width>0&&b.height>0&&c.display!=='none'&&c.visibility!=='hidden'};
+  const heads=[...document.querySelectorAll('body *')].filter(el => seen(el)
+    && /^2026\s*[.\/년-]\s*0?10\s*(월)?\.?$/.test(norm(el.textContent))
+    && [...el.children].every(c => !seen(c)));
+  for (const h of heads) {
+    const hb=h.getBoundingClientRect();
+    for(let p=h.parentElement, depth=0; p&&depth<4; p=p.parentElement,depth++) {
+      const buttons=[...p.querySelectorAll('button, [role="button"], a')].filter(seen)
+        .map(el=>({el,rect:el.getBoundingClientRect()}))
+        .filter(o => o.rect.left >= hb.right-3 && Math.abs(o.rect.top-hb.top)<50)
+        .sort((a,b)=>a.rect.left-b.rect.left);
+      if (buttons.length) {buttons[0].el.click(); return true;}
+    }
+  }
+  return false;
+}"""
+
+
+async def inspect_calendar():
+    """Check 11/7 only. Unknown means no alert, never 'available'."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(channel='chrome', headless=True, args=['--no-sandbox'])
+        context = await browser.new_context(locale='ko-KR', timezone_id='Asia/Seoul',
+                                            viewport={'width': 1100, 'height': 950})
+        page = await context.new_page()
+        try:
+            try:
+                await page.goto(DIRECT_URL, wait_until='domcontentloaded', timeout=18000)
+            except PlaywrightTimeoutError:
+                print('Direct booking loading timeout; inspecting partial page.', flush=True)
+            await page.wait_for_timeout(1000)
+
+            # The booking calendar is sometimes below the "예매하기" button.
+            for frame in list(page.frames):
+                for role in ('button', 'link'):
+                    try:
+                        locator = frame.get_by_role(role, name=re.compile(r'^\s*(?:예매하기|예약하기)\s*$'))
+                        if await locator.count() and await locator.first.is_visible():
+                            await locator.first.click(timeout=2200)
+                            print('Opened booking calendar.', flush=True)
+                            break
+                    except Exception:
+                        pass
+            await page.wait_for_timeout(750)
+
+            for attempt in range(3):
+                pages = list(context.pages)
+                for active_page in pages:
+                    for frame in list(active_page.frames):
+                        try:
+                            result = await frame.evaluate(CALENDAR_JS)
+                            if result['status'] in ('open', 'sold_out'):
+                                print('Calendar:', result, flush=True)
+                                await diagnostic_calendar(active_page)
+                                return result['status']
+                        except Exception as exc:
+                            print('Calendar inspect error:', type(exc).__name__, flush=True)
+                moved = False
+                if attempt < 2:
+                    for active_page in pages:
+                        for frame in list(active_page.frames):
+                            try:
+                                # Only move forward when the *October* calendar header is visible.
+                                # If already in November but the day cell is unrecognized, remain UNKNOWN.
+                                is_october = await frame.evaluate(r"""() => [...document.querySelectorAll('body *')].some(el => {
+                                    const t = (el.innerText || '').trim();
+                                    const box = el.getBoundingClientRect();
+                                    return box.width > 0 && box.height > 0
+                                        && /^2026\s*[.\/년-]\s*0?10\s*(월)?\.?$/.test(t)
+                                        && [...el.children].every(c => !c.getBoundingClientRect().width);
+                                })""")
+                                if not is_october:
+                                    continue
+                                # First try the named next-month control.
+                                next_btn = frame.get_by_role('button', name=re.compile(r'다음\s*(?:달|월)|next\s*month', re.I))
+                                if await next_btn.count() and await next_btn.first.is_visible():
+                                    await next_btn.first.click(timeout=2000)
+                                    moved = True
+                                    break
+                                # Fall back to the unlabeled chevron beside '2026.10'.
+                                if await frame.evaluate(NEXT_MONTH_JS):
+                                    moved = True
+                                    break
+                            except Exception as exc:
+                                print('Next-month attempt:', type(exc).__name__, flush=True)
+                        if moved:
+                            break
+                if not moved:
+                    break
+                await page.wait_for_timeout(800)
+
+            await diagnostic_calendar(context.pages[-1])
+            print('Calendar status UNKNOWN (no verified 11/7 date cell).', flush=True)
+            return 'unknown'
+        except Exception as exc:
+            print('Calendar exception:', repr(exc), flush=True)
+            return 'unknown'
+        finally:
+            await browser.close()
+
+
+async def diagnostic_calendar(page):
+    if os.environ.get('DEBUG_SCREENSHOT', '').lower() == 'true':
+        Path('debug').mkdir(exist_ok=True)
+        try:
+            await page.screenshot(path='debug/calendar_page.png', timeout=6000)
+        except Exception as exc:
+            print('Calendar screenshot error:', type(exc).__name__, flush=True)
+
+
+async def check_limited(coro, seconds, label):
+    try:
+        return await asyncio.wait_for(coro, timeout=seconds)
+    except Exception as exc:
+        print(f'{label} timed out or failed: {type(exc).__name__}: {exc}', flush=True)
+        return 'unknown'
+
+
 async def main():
     now = datetime.now(SEOUL)
-    if now.year > 2026 or (now.year == 2026 and (now.month, now.day) > (11, 7)):
-        print('Event already ended. Disable the scheduled workflow.', flush=True)
+    if now.date().isoformat() > '2026-11-07':
+        print('Event date passed; skip monitoring.', flush=True)
         return
+    state = load_state()
+    started = time.monotonic()
+    manual = os.environ.get('SEND_TEST', '').lower() == 'true'
+    # One GitHub scheduled run every 5 minutes. Inspect at 0, 60, 120, 180, 240s.
+    # The first check also scans the general Naver ticket list; later checks
+    # focus on the specific booking calendar to save time and reduce traffic.
+    rounds = 1 if manual else 5
+    for i in range(rounds):
+        print(f'-- Poll {i + 1}/{rounds}, Korea time: {datetime.now(SEOUL).isoformat()} --', flush=True)
+        if i == 0:
+            product, calendar = await asyncio.gather(
+                check_limited(inspect_page(), 50, 'Ticket list'),
+                check_limited(inspect_calendar(), 40, 'Calendar'))
+        else:
+            product = 'unknown'
+            calendar = await check_limited(inspect_calendar(), 40, 'Calendar')
+        print(f'Product={product}; Calendar={calendar}; previous={state}', flush=True)
 
-    status = await inspect_page()
-    old = load_state()
-    print(f'Status={status}; prior_visible={old}; KST={now.isoformat()}', flush=True)
+        if manual:
+            prod_labels = {'found':'상품 발견','not_found':'상품 미표시','unknown':'화면 확인 불가'}
+            cal_labels = {'open':'11/7 날짜 선택 가능','sold_out':'11/7 매진','unknown':'11/7 달력 판독 불가'}
+            send_telegram('🧪 [낙화놀이 1분 감시 테스트]\n'
+                          + '상품: ' + prod_labels[product] + '\n'
+                          + '예약 달력: ' + cal_labels[calendar] + '\n' + DIRECT_URL)
 
-    if os.environ.get('SEND_TEST', '').lower() == 'true':
-        names = {'found': '행사 상품명 발견', 'not_found': '상품명 미표시', 'unknown': '페이지 확인 불가(접속 차단/구조 변경 가능)'}
-        send_telegram('🧪 [낙화놀이 감시 테스트]\n텔레그램 봇 연결 성공!\n웹페이지 확인: ' + names[status] + '\n' + TARGET_URL)
+        modified = False
+        if product == 'found' and not state['visible']:
+            send_telegram('🔔 [낙화놀이 상품 발견]\n11월 7일 예매 상품이 목록에 나타났습니다.\n' + DIRECT_URL)
+            state['visible'] = True
+            modified = True
+        elif product == 'not_found' and state['visible']:
+            state['visible'] = False
+            modified = True
 
-    if status == 'found' and not old:
-        send_telegram(
-            '🚨 [백제문화단지 낙화놀이 예매 화면 발견]\n'
-            '2026년 백제문화단지 낙화놀이(11/7) 상품명이 페이지에 나타났습니다.\n'
-            '※ 실제 잔여 수량/결제 가능 여부는 직접 확인해야 합니다.\n'
-            + TARGET_URL
-        )
-        save_state(True)
-        print('New appearance: notification sent and state saved.', flush=True)
-    elif status == 'not_found' and old:
-        save_state(False)
-        print('Ticket heading disappeared; ready to alert on next appearance.', flush=True)
-    elif status == 'unknown':
-        print('Could not reliably inspect the page; previous state retained.', flush=True)
-    else:
-        print('No state change; no event alert needed.', flush=True)
+        if calendar == 'open' and state['calendar'] != 'open':
+            send_telegram('🚨 [11/7 낙화놀이 예약 가능 가능성]\n'
+                          '11월 7일 달력의 매진 문구가 보이지 않고 날짜가 선택 가능한 것으로 감지됐어요.\n'
+                          '실제 예약 가능한지 즉시 확인하세요!\n' + DIRECT_URL)
+            state['calendar'] = 'open'
+            modified = True
+        elif calendar == 'sold_out' and state['calendar'] != 'sold_out':
+            state['calendar'] = 'sold_out'
+            modified = True
+
+        if modified:
+            save_state(state)
+            print('Updated state saved.', flush=True)
+        else:
+            print('No new confirmed state; no alert.', flush=True)
+
+        if i < rounds - 1:
+            # Start checks roughly every 60s (even when a check takes time).
+            pause = max(0, started + 60 * (i + 1) - time.monotonic())
+            print(f'Next check in {pause:.0f}s.', flush=True)
+            await asyncio.sleep(pause)
 
 
 if __name__ == '__main__':
