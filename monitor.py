@@ -203,48 +203,53 @@ async def inspect_page():
 # Read the exact booking date's rendered calendar cell; do not infer availability
 # merely because the word "매진" is absent elsewhere on the page.
 CALENDAR_JS = r"""() => {
-  const tidy = s => (s || '').replace(/\s+/g, ' ').trim();
-  const visible = el => {
-    if (!el) return false;
-    const css = getComputedStyle(el), b = el.getBoundingClientRect();
-    return css.display !== 'none' && css.visibility !== 'hidden' && b.width > 0 && b.height > 0;
+  const norm = v => (v || '').replace(/\s+/g, ' ').trim();
+  const visible = e => {
+    if(!e) return false;
+    const s=getComputedStyle(e), r=e.getBoundingClientRect();
+    return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
   };
-  const leaf = el => [...el.children].every(c => !visible(c));
-  const text = el => tidy(el.innerText || el.textContent);
-  const nodes = [...document.querySelectorAll('body *')];
-  // Identify the month heading itself, not '2026.11.07' in an event description.
-  const headings = nodes.filter(el => visible(el) && leaf(el)
-       && /^2026\s*[.\/년-]\s*0?11\s*(월)?\.?$/.test(text(el)));
-  if (!headings.length) return {status:'unknown', reason:'11월 달력 제목 미발견'};
-  for (const h of headings) {
-    const hb = h.getBoundingClientRect();
-    const sevens = nodes.filter(el => visible(el) && leaf(el)
-      && /^0?7\s*(일)?$/.test(text(el)) && (() => {
-        const r=el.getBoundingClientRect();
-        return r.top >= hb.bottom - 8 && r.top <= hb.bottom + 410
-          && Math.abs(r.left - hb.left) < 550;
-      })());
-    for (const seven of sevens) {
-      let tile = seven;
-      let hasSold = false, blocked = false, actionable = false;
-      for (let depth=0; depth < 5 && tile; depth++, tile=tile.parentElement) {
-        const r=tile.getBoundingClientRect(), t=text(tile);
-        // Do not examine entire week, month or the whole page.
-        if (r.width > 180 || r.height > 145 || t.length > 65) break;
-        const meta = [tile.className, tile.getAttribute('aria-label'),
-                      tile.getAttribute('title'), tile.getAttribute('data-state')].join(' ');
-        if (/매진|마감|품절|예약불가|예매불가|sold.?out/i.test(t + ' ' + meta)) hasSold = true;
-        if (tile.matches('[disabled], [aria-disabled="true"], [inert]')
-          || /disabled|inactive|unavailable/i.test(meta)
-          || getComputedStyle(tile).pointerEvents === 'none') blocked = true;
-        if (tile.matches('button,a,[role="button"]') || tile.tabIndex >= 0
-          || getComputedStyle(tile).cursor === 'pointer') actionable = true;
+  const els=[...document.querySelectorAll('body *')];
+  const monthPattern=/^2026\s*(?:[.\/-]|년)\s*0?11\s*(?:월)?\s*\.?$/;
+  const headings=els.filter(e=>visible(e) && monthPattern.test(norm(e.innerText || ''))
+    && [...e.children].every(ch=>!visible(ch) || !monthPattern.test(norm(ch.innerText || ''))));
+  if(!headings.length) return {status:'unknown',reason:'2026.11 월 제목 미발견'};
+  // Only look for November 7 visually underneath the November header.
+  const candidates=[];
+  for(const h of headings){
+    const hr=h.getBoundingClientRect();
+    for(const e of els){
+      if(!visible(e)) continue;
+      const er=e.getBoundingClientRect();
+      if(er.top < hr.bottom-4 || er.top > hr.bottom+470 || er.left < hr.left-700 || er.left > hr.right+700) continue;
+      const t=norm(e.innerText || '');
+      const a=norm(e.getAttribute('aria-label') || '');
+      if(!(/^(?:0?7)(?:\s*(?:일|매진|마감|예약불가))?$/.test(t) || /2026\s*[.년\/-]\s*0?11\s*[.월\/-]\s*0?7/.test(a))) continue;
+      // Work upwards from the '7' digit to its individual calendar date tile.
+      let best=null, p=e;
+      for(let depth=0;depth<6 && p;depth++,p=p.parentElement){
+        const pr=p.getBoundingClientRect(), pt=norm(p.innerText || '');
+        if(pr.width>190 || pr.height>150 || pt.length>90) break; // never inspect whole week
+        const meta=[p.className,p.getAttribute('aria-label'),p.getAttribute('title'),p.getAttribute('data-state')].join(' ');
+        const text=pt+' '+meta;
+        const sold=/매진|마감|품절|예약불가|예매불가|sold.?out/i.test(text);
+        const disabled=p.matches('[disabled],[aria-disabled="true"],[inert]') ||
+          /disabled|inactive|unavailable|soldout|sold-out/i.test(meta) ||
+          getComputedStyle(p).pointerEvents==='none';
+        const clickable=p.matches('button,a,[role="button"]') ||
+          p.tabIndex>=0 || getComputedStyle(p).cursor==='pointer';
+        best={tileText:pt.slice(0,90),tag:p.tagName,meta:meta.slice(0,150),
+              sold,disabled,clickable,area:Math.round(pr.width*pr.height)};
+        if(sold) return {status:'sold_out',reason:'11월 7일 칸 매진',detail:best};
       }
-      if (hasSold) return {status:'sold_out', reason:'11/7 칸에 매진/마감 확인'};
-      if (actionable && !blocked) return {status:'open', reason:'11/7 매진 없음 + 날짜 선택 가능'};
+      if(best) candidates.push(best);
     }
   }
-  return {status:'unknown', reason:'11/7 칸의 선택 가능 상태를 검증하지 못함'};
+  // A non-sold-out date must also be interactive to trigger an alert.
+  if(candidates.some(c=>c.clickable && !c.disabled))
+    return {status:'open',reason:'11월 7일 칸 매진 없음 + 선택 가능',detail:candidates.find(c=>c.clickable && !c.disabled)};
+  return {status:'unknown',reason:'11월 달력은 있으나 7일 칸 판별 실패',candidateCount:candidates.length,
+          candidates:candidates.slice(0,5)};
 }"""
 
 NEXT_MONTH_JS = r"""() => {
@@ -355,9 +360,26 @@ async def diagnostic_calendar(page):
     if os.environ.get('DEBUG_SCREENSHOT', '').lower() == 'true':
         Path('debug').mkdir(exist_ok=True)
         try:
-            await page.screenshot(path='debug/calendar_page.png', timeout=6000)
+            await page.screenshot(path='debug/calendar_page.png', timeout=10000, full_page=True)
         except Exception as exc:
             print('Calendar screenshot error:', type(exc).__name__, flush=True)
+        records = []
+        for i, frame in enumerate(page.frames):
+            try:
+                info = await frame.evaluate(r"""() => {
+                    const t=(document.body?.innerText || '').slice(0,12000);
+                    const fields=[...document.querySelectorAll('button,[role=button],a,[aria-label]')]
+                      .filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0})
+                      .map(e=>({tag:e.tagName,text:(e.innerText||'').trim().slice(0,90),
+                         label:e.getAttribute('aria-label'), cls:String(e.className).slice(0,120)}))
+                      .filter(x=>/2026|11|달|월|7|매진|예약|다음/.test(x.text+' '+x.label)).slice(0,75);
+                    return {title:document.title,bodyText:t,controls:fields};
+                }""")
+                records.append({'frame':i,'url':frame.url, 'info':info})
+            except Exception as exc:
+                records.append({'frame':i, 'error':type(exc).__name__})
+        Path('debug/calendar_dom.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+        print('Calendar DOM text diagnostic saved.', flush=True)
 
 
 async def check_limited(coro, seconds, label):
