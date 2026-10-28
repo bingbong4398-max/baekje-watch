@@ -203,78 +203,92 @@ async def inspect_page():
 # Read the exact booking date's rendered calendar cell; do not infer availability
 # merely because the word "매진" is absent elsewhere on the page.
 CALENDAR_JS = r"""() => {
-  const norm = v => (v || '').replace(/\s+/g, ' ').trim();
-  const visible = e => {
-    if(!e) return false;
-    const s=getComputedStyle(e), r=e.getBoundingClientRect();
-    return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
-  };
-  const els=[...document.querySelectorAll('body *')];
-  const monthPattern=/^2026\s*(?:[.\/-]|년)\s*0?11\s*(?:월)?\s*\.?$/;
-  const headings=els.filter(e=>visible(e) && monthPattern.test(norm(e.innerText || ''))
-    && [...e.children].every(ch=>!visible(ch) || !monthPattern.test(norm(ch.innerText || ''))));
-  if(!headings.length) return {status:'unknown',reason:'2026.11 월 제목 미발견'};
-  // Only look for November 7 visually underneath the November header.
-  const candidates=[];
-  for(const h of headings){
-    const hr=h.getBoundingClientRect();
-    for(const e of els){
-      if(!visible(e)) continue;
-      const er=e.getBoundingClientRect();
-      if(er.top < hr.bottom-4 || er.top > hr.bottom+470 || er.left < hr.left-700 || er.left > hr.right+700) continue;
-      const t=norm(e.innerText || '');
-      const a=norm(e.getAttribute('aria-label') || '');
-      if(!(/^(?:0?7)(?:\s*(?:일|매진|마감|예약불가))?$/.test(t) || /2026\s*[.년\/-]\s*0?11\s*[.월\/-]\s*0?7/.test(a))) continue;
-      // Work upwards from the '7' digit to its individual calendar date tile.
-      let best=null, p=e;
-      for(let depth=0;depth<6 && p;depth++,p=p.parentElement){
-        const pr=p.getBoundingClientRect(), pt=norm(p.innerText || '');
-        if(pr.width>190 || pr.height>150 || pt.length>90) break; // never inspect whole week
-        const meta=[p.className,p.getAttribute('aria-label'),p.getAttribute('title'),p.getAttribute('data-state')].join(' ');
-        const text=pt+' '+meta;
-        const sold=/매진|마감|품절|예약불가|예매불가|sold.?out/i.test(text);
-        const disabled=p.matches('[disabled],[aria-disabled="true"],[inert]') ||
-          /disabled|inactive|unavailable|soldout|sold-out/i.test(meta) ||
-          getComputedStyle(p).pointerEvents==='none';
-        const clickable=p.matches('button,a,[role="button"]') ||
-          p.tabIndex>=0 || getComputedStyle(p).cursor==='pointer';
-        best={tileText:pt.slice(0,90),tag:p.tagName,meta:meta.slice(0,150),
-              sold,disabled,clickable,area:Math.round(pr.width*pr.height)};
-        if(sold) return {status:'sold_out',reason:'11월 7일 칸 매진',detail:best};
-      }
-      if(best) candidates.push(best);
-    }
+  const norm = x => (x || '').replace(/\s+/g,' ').trim();
+  const body = document.body?.innerText || '';
+  // We ONLY inspect November. The Naver UI initially opens in October.
+  if (!/(?:^|\n)\s*2026\s*[.]\s*11\s*(?:\n|$)/.test(body)) {
+    return {status:'unknown',reason:'November month heading not visible'};
   }
-  // A non-sold-out date must also be interactive to trigger an alert.
-  if(candidates.some(c=>c.clickable && !c.disabled))
-    return {status:'open',reason:'11월 7일 칸 매진 없음 + 선택 가능',detail:candidates.find(c=>c.clickable && !c.disabled)};
-  return {status:'unknown',reason:'11월 달력은 있으나 7일 칸 판별 실패',candidateCount:candidates.length,
-          candidates:candidates.slice(0,5)};
+  const dates = [...document.querySelectorAll('button.calendar_date')];
+  const valid = dates.filter(btn => {
+    const t=norm(btn.innerText || btn.textContent);
+    // Naver date button may include "7" or "7 매진".
+    return /^0?7(?:$|\s|일|매진|마감|예약|예매|품절)/.test(t);
+  });
+  if (!valid.length) return {status:'unknown',reason:'No Nov 7 calendar_date button', dateButtons:dates.length};
+
+  const results = [];
+  for (const button of valid) {
+    const ancestors = [button];
+    for(let p=button.parentElement, n=0; p && n<4; p=p.parentElement,n++){
+      // Stop before whole weeks / table: don't mix other dates with 7.
+      if (p.querySelectorAll('button.calendar_date').length !== 1) break;
+      ancestors.push(p);
+    }
+    const localText=norm(ancestors.map(x=>x.innerText).join(' '));
+    const meta=ancestors.map(x=>[x.className,x.getAttribute('aria-label'),x.getAttribute('title'),x.getAttribute('data-state')].join(' ')).join(' ');
+    const hasSoldOut=/매진|판매\s*마감|예약\s*마감|예매\s*마감|품절|sold.?out/i.test(localText+' '+meta);
+    const disabled=button.disabled || button.getAttribute('aria-disabled')==='true' ||
+      /(?:^|\s)(?:unselectable|disabled|dayoff|inactive|soldout|sold-out)(?:\s|$)/i.test(String(button.className)) ||
+      getComputedStyle(button).pointerEvents==='none';
+    results.push({text:localText.slice(0,100),buttonClass:String(button.className),disabled,
+                  soldOut:hasSoldOut,buttonHTML:button.outerHTML.slice(0,550)});
+  }
+  if(results.some(x=>x.soldOut))
+    return {status:'sold_out', reason:'11/7 tile explicitly says sold out',details:results};
+  if(results.length===1 && !results[0].disabled)
+    return {status:'open', reason:'11/7 is a selectable date, no sold-out marking',details:results};
+  // Do not notify merely because "매진" is missing while date is disabled.
+  return {status:'unavailable',reason:'Nov 7 is not selectable',details:results};
 }"""
 
-NEXT_MONTH_JS = r"""() => {
-  const norm=s=>(s||'').replace(/\s+/g,' ').trim();
-  const seen=e=>{if(!e)return false;const b=e.getBoundingClientRect(),c=getComputedStyle(e);
-    return b.width>0&&b.height>0&&c.display!=='none'&&c.visibility!=='hidden'};
-  const heads=[...document.querySelectorAll('body *')].filter(el => seen(el)
-    && /^2026\s*[.\/년-]\s*0?10\s*(월)?\.?$/.test(norm(el.textContent))
-    && [...el.children].every(c => !seen(c)));
-  for (const h of heads) {
-    const hb=h.getBoundingClientRect();
-    for(let p=h.parentElement, depth=0; p&&depth<4; p=p.parentElement,depth++) {
-      const buttons=[...p.querySelectorAll('button, [role="button"], a')].filter(seen)
-        .map(el=>({el,rect:el.getBoundingClientRect()}))
-        .filter(o => o.rect.left >= hb.right-3 && Math.abs(o.rect.top-hb.top)<50)
-        .sort((a,b)=>a.rect.left-b.rect.left);
-      if (buttons.length) {buttons[0].el.click(); return true;}
-    }
-  }
-  return false;
-}"""
+
+async def visible_month(frame):
+    """Read the displayed calendar month, not the text in the event title."""
+    try:
+        text = await frame.locator('body').inner_text(timeout=3500)
+    except Exception:
+        return None
+    match = re.search(r'(?m)^\s*2026\s*\.\s*(10|11)\s*$', text)
+    return int(match.group(1)) if match else None
+
+
+async def navigate_to_november(context):
+    """Use the exact button observed in user's diagnostic: BUTTON.btn_next, aria-label=다음달."""
+    pages = list(context.pages)
+    for page in pages:
+        for frame in list(page.frames):
+            month = await visible_month(frame)
+            if month == 11:
+                print('Calendar navigation: already November.',flush=True)
+                return frame
+            if month != 10:
+                continue
+            print('Calendar navigation: October visible; locating button.btn_next.',flush=True)
+            candidates = [
+                frame.locator('button.btn_next:not(.disabled)'),
+                frame.locator('button[aria-label="다음달"]'),
+                frame.get_by_role('button', name='다음달'),
+            ]
+            for loc in candidates:
+                try:
+                    if not await loc.count() or not await loc.first.is_visible():
+                        continue
+                    await loc.first.click(timeout=5500)
+                    for _ in range(12):
+                        await page.wait_for_timeout(500)
+                        new_month=await visible_month(frame)
+                        if new_month == 11:
+                            print('Calendar navigation successful: 2026.10 -> 2026.11',flush=True)
+                            return frame
+                    print('Next-month button clicked but 2026.11 was not found.',flush=True)
+                except Exception as exc:
+                    print('Next-month click error:',type(exc).__name__,str(exc)[:160],flush=True)
+    return None
 
 
 async def inspect_calendar():
-    """Check 11/7 only. Unknown means no alert, never 'available'."""
+    """Read the Nov 7 date tile; unknown/unavailable must NEVER trigger an availability alert."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(channel='chrome', headless=True, args=['--no-sandbox'])
         context = await browser.new_context(locale='ko-KR', timezone_id='Asia/Seoul',
@@ -284,73 +298,31 @@ async def inspect_calendar():
             try:
                 await page.goto(DIRECT_URL, wait_until='domcontentloaded', timeout=18000)
             except PlaywrightTimeoutError:
-                print('Direct booking loading timeout; inspecting partial page.', flush=True)
+                print('Direct page loading timed out; checking partial page.',flush=True)
             await page.wait_for_timeout(1000)
 
-            # The booking calendar is sometimes below the "예매하기" button.
-            for frame in list(page.frames):
-                for role in ('button', 'link'):
+            # If calendar isn't visible, click the booking tab once.
+            if not any([await visible_month(f) in (10,11) for f in list(page.frames)]):
+                for f in list(page.frames):
                     try:
-                        locator = frame.get_by_role(role, name=re.compile(r'^\s*(?:예매하기|예약하기)\s*$'))
-                        if await locator.count() and await locator.first.is_visible():
-                            await locator.first.click(timeout=2200)
-                            print('Opened booking calendar.', flush=True)
+                        tab = f.get_by_role('button',name=re.compile(r'^\s*(?:예매하기|예약하기)\s*$'))
+                        if await tab.count() and await tab.first.is_visible():
+                            await tab.first.click(timeout=3500)
                             break
                     except Exception:
                         pass
-            await page.wait_for_timeout(750)
+                await page.wait_for_timeout(900)
 
-            for attempt in range(3):
-                pages = list(context.pages)
-                for active_page in pages:
-                    for frame in list(active_page.frames):
-                        try:
-                            result = await frame.evaluate(CALENDAR_JS)
-                            if result['status'] in ('open', 'sold_out'):
-                                print('Calendar:', result, flush=True)
-                                await diagnostic_calendar(active_page)
-                                return result['status']
-                        except Exception as exc:
-                            print('Calendar inspect error:', type(exc).__name__, flush=True)
-                moved = False
-                if attempt < 2:
-                    for active_page in pages:
-                        for frame in list(active_page.frames):
-                            try:
-                                # Only move forward when the *October* calendar header is visible.
-                                # If already in November but the day cell is unrecognized, remain UNKNOWN.
-                                is_october = await frame.evaluate(r"""() => [...document.querySelectorAll('body *')].some(el => {
-                                    const t = (el.innerText || '').trim();
-                                    const box = el.getBoundingClientRect();
-                                    return box.width > 0 && box.height > 0
-                                        && /^2026\s*[.\/년-]\s*0?10\s*(월)?\.?$/.test(t)
-                                        && [...el.children].every(c => !c.getBoundingClientRect().width);
-                                })""")
-                                if not is_october:
-                                    continue
-                                # First try the named next-month control.
-                                next_btn = frame.get_by_role('button', name=re.compile(r'다음\s*(?:달|월)|next\s*month', re.I))
-                                if await next_btn.count() and await next_btn.first.is_visible():
-                                    await next_btn.first.click(timeout=2000)
-                                    moved = True
-                                    break
-                                # Fall back to the unlabeled chevron beside '2026.10'.
-                                if await frame.evaluate(NEXT_MONTH_JS):
-                                    moved = True
-                                    break
-                            except Exception as exc:
-                                print('Next-month attempt:', type(exc).__name__, flush=True)
-                        if moved:
-                            break
-                if not moved:
-                    break
-                await page.wait_for_timeout(800)
-
+            november_frame = await navigate_to_november(context)
+            result={'status':'unknown','reason':'Could not navigate to November calendar'}
+            if november_frame is not None:
+                await page.wait_for_timeout(550)
+                result = await november_frame.evaluate(CALENDAR_JS)
+            print('Nov 7 calendar result:',json.dumps(result,ensure_ascii=False)[:1800],flush=True)
             await diagnostic_calendar(context.pages[-1])
-            print('Calendar status UNKNOWN (no verified 11/7 date cell).', flush=True)
-            return 'unknown'
+            return result['status']
         except Exception as exc:
-            print('Calendar exception:', repr(exc), flush=True)
+            print('Calendar inspection error:',repr(exc),flush=True)
             return 'unknown'
         finally:
             await browser.close()
@@ -373,7 +345,12 @@ async def diagnostic_calendar(page):
                       .map(e=>({tag:e.tagName,text:(e.innerText||'').trim().slice(0,90),
                          label:e.getAttribute('aria-label'), cls:String(e.className).slice(0,120)}))
                       .filter(x=>/2026|11|달|월|7|매진|예약|다음/.test(x.text+' '+x.label)).slice(0,75);
-                    return {title:document.title,bodyText:t,controls:fields};
+                    const dates=[...document.querySelectorAll('button.calendar_date')].map(e=>({
+                      text:(e.innerText||'').trim().slice(0,70),className:String(e.className),
+                      disabled:e.disabled,html:e.outerHTML.slice(0,420)}));
+                    const month=(t.match(/(?:^|\n)\s*2026\.\s*(10|11)\s*(?:\n|$)/)||[])[1] || null;
+                    return {title:document.title,detectedMonth:month,bodyText:t,controls:fields,
+                            calendarDates:dates};
                 }""")
                 records.append({'frame':i,'url':frame.url, 'info':info})
             except Exception as exc:
@@ -415,7 +392,7 @@ async def main():
 
         if manual:
             prod_labels = {'found':'상품 발견','not_found':'상품 미표시','unknown':'화면 확인 불가'}
-            cal_labels = {'open':'11/7 날짜 선택 가능','sold_out':'11/7 매진','unknown':'11/7 달력 판독 불가'}
+            cal_labels = {'open':'11/7 날짜 선택 가능','sold_out':'11/7 매진','unavailable':'11/7 선택 불가(매진 표시는 확인 안 됨)','unknown':'11/7 달력 판독 불가'}
             send_telegram('🧪 [낙화놀이 1분 감시 테스트]\n'
                           + '상품: ' + prod_labels[product] + '\n'
                           + '예약 달력: ' + cal_labels[calendar] + '\n' + DIRECT_URL)
